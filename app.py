@@ -466,6 +466,55 @@ def make_request_with_retry(method, url, max_retries=3, retry_delay=1, **kwargs)
     print(f"❌ {api_name} API 请求失败，已达到最大重试次数 ({max_retries} 次)，URL: {display_url}")
     return None
 
+def _library_item_ready(item: dict) -> bool:
+    """判定：是否已经刮削/解析到足够信息。MetaTube 刮不到也不致命，超时后照样发。"""
+    if not isinstance(item, dict):
+        return False
+
+    # 1) 有简介（MetaTube 写入/本地 NFO/手工编辑都可能）
+    overview = (item.get("Overview") or "").strip()
+    if overview:
+        return True
+
+    # 2) 有媒体流（清晰度/编码/音轨等通常来自 Emby 媒体分析，稍后才会出现）
+    streams = item.get("MediaStreams") or []
+    if isinstance(streams, list) and len(streams) > 0:
+        return True
+
+    return False
+
+
+def fetch_library_item_with_poll(item_id: str) -> dict:
+    """按配置等待并轮询 Emby item，直到 ready 或超时。"""
+    wait_first = int(get_setting("settings.library_new_wait_first_seconds") or 20)
+    interval = int(get_setting("settings.library_new_poll_interval_seconds") or 15)
+    max_polls = int(get_setting("settings.library_new_max_polls") or 8)
+
+    # 复用你原来那条 full_item_url + params 的逻辑
+    full_item_url = f"{EMBY_SERVER_URL}/Users/{EMBY_USER_ID}/Items/{item_id}"
+    params = {
+        "api_key": EMBY_API_KEY,
+        "Fields": "ProviderIds,Path,Overview,ProductionYear,ServerId,DateCreated,SeriesProviderIds,ParentIndexNumber,SeriesId,MediaStreams"
+    }
+
+    if wait_first > 0:
+        time.sleep(wait_first)
+
+    last_item = None
+    for i in range(max_polls):
+        resp = make_request_with_retry("GET", full_item_url, params=params, timeout=10)
+        if resp:
+            last_item = resp.json()
+            if _library_item_ready(last_item):
+                print(f"✅ 条目已就绪（第 {i+1} 次轮询命中），将发送更完整通知。")
+                return last_item
+
+        print(f"⏳ 条目未就绪（第 {i+1}/{max_polls} 次），{interval}s 后重试…")
+        time.sleep(interval)
+
+    print("⚠️ 等待超时，仍未就绪：可能 MetaTube 刮不到或 Emby 分析较慢，将按现有信息发送。")
+    return last_item or {}
+    
 def parse_episode_ranges_from_description(description: str):
     """
     从 Webhook 的 Description 中解析多集范围。
@@ -1380,7 +1429,11 @@ def get_media_details(item, user_id):
     """
     details = {'poster_url': None, 'tmdb_link': None, 'year': None, 'tmdb_id': None}
     if not TMDB_API_TOKEN:
-        print("⚠️ 未配置 TMDB_API_TOKEN，跳过获取节目详情。")
+        print("⚠️ 未配置 TMDB_API_TOKEN，使用 Emby 海报作为封面。")
+        item_id = item.get("Id")
+        if item_id and EMBY_SERVER_URL and EMBY_API_KEY:
+            details["poster_url"] = f"{EMBY_SERVER_URL}/Items/{item_id}/Images/Primary?api_key={EMBY_API_KEY}"
+        details["year"] = item.get("ProductionYear") or extract_year_from_path(item.get("Path"))
         return details
     item_type = item.get('Type')
     tmdb_id, api_type = None, None
@@ -1460,28 +1513,65 @@ def safe_edit_or_send_message(chat_id, message_id, text, buttons=None, disable_p
 
 def send_telegram_notification(text, photo_url=None, chat_id=None, inline_buttons=None, disable_preview=False):
     """
-    发送一个Telegram通知，可以选择带图片和内联按钮。
-    :param text: 消息文本
-    :param photo_url: 图片URL
-    :param chat_id: 聊天ID
-    :param inline_buttons: 内联按钮列表
-    :param disable_preview: 是否禁用URL预览
+    发送一个Telegram通知：
+    - 如果有 photo_url：先由本机下载图片 bytes，再以 multipart 上传给 Telegram（避免 Telegram 抓 URL 失败 & 避免暴露 api_key）
+    - 如果下载/上传失败：自动降级为 sendMessage（保证不丢通知）
     """
     if not chat_id:
         print("❌ 错误：未指定 chat_id。")
         return
+
     print(f"💬 正在向 Chat ID {chat_id} 发送 Telegram 通知...")
     proxies = {'http': HTTP_PROXY, 'https': HTTP_PROXY} if HTTP_PROXY else None
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/" + ('sendPhoto' if photo_url else 'sendMessage')
-    payload = {'chat_id': chat_id, 'parse_mode': 'MarkdownV2', 'disable_web_page_preview': disable_preview}
-    if photo_url:
-        payload['photo'], payload['caption'] = photo_url, text
-    else:
-        payload['text'] = text
+    api_base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/"
+
+    # 统一准备按钮
+    reply_markup = None
     if inline_buttons:
         keyboard_layout = inline_buttons if isinstance(inline_buttons[0], list) else [[button] for button in inline_buttons]
-        payload['reply_markup'] = json.dumps({'inline_keyboard': keyboard_layout})
-    make_request_with_retry('POST', api_url, data=payload, timeout=20, proxies=proxies)
+        reply_markup = json.dumps({'inline_keyboard': keyboard_layout})
+
+    # 1) 有封面：先下载后上传
+    if photo_url:
+        try:
+            # 下载图片（由我们服务器访问 Emby，避免 Telegram 去抓 URL）
+            img_resp = make_request_with_retry('GET', photo_url, timeout=15, proxies=proxies)
+            if img_resp and img_resp.status_code == 200:
+                ct = (img_resp.headers.get('Content-Type') or '').lower()
+                if ct.startswith('image/'):
+                    files = {'photo': ('poster.jpg', img_resp.content)}
+                    data = {
+                        'chat_id': chat_id,
+                        'caption': text,
+                        'parse_mode': 'MarkdownV2',
+                        'disable_web_page_preview': disable_preview
+                    }
+                    if reply_markup:
+                        data['reply_markup'] = reply_markup
+
+                    resp = make_request_with_retry('POST', api_base + 'sendPhoto', data=data, files=files, timeout=20, proxies=proxies)
+                    if resp:
+                        return
+                    print("⚠️ sendPhoto(upload) 失败，将降级为纯文字。")
+                else:
+                    print(f"⚠️ 海报下载成功但不是图片 content-type={ct}，将降级为纯文字。")
+            else:
+                sc = img_resp.status_code if img_resp else None
+                print(f"⚠️ 海报下载失败 status={sc}，将降级为纯文字。")
+        except Exception as e:
+            print(f"⚠️ 海报下载/上传异常：{e}，将降级为纯文字。")
+
+    # 2) 降级：发纯文本
+    payload = {
+        'chat_id': chat_id,
+        'text': text,
+        'parse_mode': 'MarkdownV2',
+        'disable_web_page_preview': disable_preview
+    }
+    if reply_markup:
+        payload['reply_markup'] = reply_markup
+
+    make_request_with_retry('POST', api_base + 'sendMessage', data=payload, timeout=20, proxies=proxies)
 
 def send_deletable_telegram_notification(text, photo_url=None, chat_id=None, inline_buttons=None, delay_seconds=60, disable_preview=False):
     """
@@ -4517,15 +4607,16 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 stream_details = None
 
                 if item.get('Id') and EMBY_USER_ID:
-                    print(f"ℹ️ 正在使用 Emby API 补充项目 {item.get('Id')} 的元数据。")
-                    full_item_url = f"{EMBY_SERVER_URL}/Users/{EMBY_USER_ID}/Items/{item.get('Id')}"
-                    params = {'api_key': EMBY_API_KEY, 'Fields': 'ProviderIds,Path,Overview,ProductionYear,ServerId,DateCreated,SeriesProviderIds,ParentIndexNumber,SeriesId'}
-                    response = make_request_with_retry('GET', full_item_url, params=params, timeout=10)
-                    if response:
-                        item = response.json()
-                        print("✅ 补充元数据成功。")
+                    item_id = item.get("Id")
+                    print(f"ℹ️ 正在轮询等待项目 {item_id} 刮削/分析完成…")
+                    polled = fetch_library_item_with_poll(item_id)
+
+                    # 只在 polled 返回了有效条目时才覆盖
+                    if isinstance(polled, dict) and polled.get("Id"):
+                        item = polled
+                        print("✅ 补充元数据成功（轮询获取）。")
                     else:
-                        print("❌ 补充元数据失败，将使用 Webhook 原始数据。")
+                        print("⚠️ 轮询补充元数据失败，将使用 Webhook 原始数据。")
 
                 media_details = get_media_details(item, event_data.get('User', {}).get('Id'))
                 added_summary, added_list = parse_episode_ranges_from_description(event_data.get('Description', ''))
@@ -4630,7 +4721,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         parts.append(f"节目类型：{escape_markdown(raw_program_type)}")
 
                 if get_setting('settings.content_settings.new_library_notification.show_overview'):
-                    overview_text = item.get('Overview', '暂无剧情简介')
+                    overview_text = (item.get("Overview") or "").strip() or "暂无剧情简介"
                     if overview_text:
                         overview_text = overview_text[:150] + "..." if len(overview_text) > 150 else overview_text
                         parts.append(f"剧情：{escape_markdown(overview_text)}")
