@@ -2,6 +2,9 @@
 # 机器人核心设置
 # =======================================================
 settings:
+  library_new_wait_first_seconds: 20     # 收到事件后先等 20s（给 Emby/MetaTube 起跑时间）
+  library_new_poll_interval_seconds: 15  # 每次重试间隔 15s
+  library_new_max_polls: 8               # 最多重试 8 次（总等待≈20 + 8*15 = 140s）
   # 推送内容设置：控制各类通知消息中显示哪些信息
   content_settings:
     # 新增节目通知内容设置
